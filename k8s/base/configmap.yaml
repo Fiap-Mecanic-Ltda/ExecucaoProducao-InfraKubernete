@@ -1,0 +1,42 @@
+# Configuracao nao sensivel da Execucao. Segredos (chave JWT, credenciais do RabbitMQ,
+# New Relic) vem do Secret "execucao-service-secrets", e o prefixo/regiao das tabelas do
+# ConfigMap "execucao-service-dynamodb"; os dois sao montados pela pipeline a partir do
+# SSM (ver .github/workflows/deploy.yml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: execucao-service-config
+  namespace: execucao
+  labels:
+    app.kubernetes.io/part-of: mechanicltda
+    app.kubernetes.io/name: execucao-service
+data:
+  ASPNETCORE_ENVIRONMENT: "Production"
+
+  # Mesmos emissores e audiencia do monolito: os tokens continuam sendo emitidos
+  # pelo MechanicLtda (/auth/login) e pela Lambda (/auth/cpf).
+  JwtSettings__Issuer: "MechanicLtda.API"
+  JwtSettings__IssuerCpf: "MechanicLtda.Auth.Cpf"
+  JwtSettings__Audience: "MechanicLtda.Clients"
+
+  # Na AWS as tabelas vem do Terraform (ExecucaoProducao-InfraSGBD): a API nunca as cria.
+  DynamoDb__CriarTabelas: "false"
+
+  # Consumidores da Saga desligados ate a virada (Etapa 9). Desligada, a API atende so
+  # pelas rotas REST e nao conecta no RabbitMQ.
+  Mensageria__Habilitada: "false"
+  Mensageria__Transporte: "RabbitMq"
+  RabbitMq__Host: "rabbitmq.mensageria.svc.cluster.local"
+  RabbitMq__VirtualHost: "/"
+
+  # Modo automatico (diagnostico e reparo avancam sozinhos) e so para demonstracao.
+  Execucao__ModoAutomatico: "false"
+  Execucao__SegundosPorPasso: "3"
+
+  # Agente APM do New Relic (so coleta com NEW_RELIC_LICENSE_KEY, que vem do Secret).
+  NEW_RELIC_APP_NAME: "mechanicltda-execucao-service"
+  NEW_RELIC_DISTRIBUTED_TRACING_ENABLED: "true"
+  NEW_RELIC_APPLICATION_LOGGING_ENABLED: "true"
+  NEW_RELIC_APPLICATION_LOGGING_FORWARDING_ENABLED: "true"
+  NEW_RELIC_APPLICATION_LOGGING_FORWARDING_CONTEXT_DATA_ENABLED: "true"
+  NEW_RELIC_LABELS: "ambiente:prod;projeto:mechanicltda;servico:execucao"

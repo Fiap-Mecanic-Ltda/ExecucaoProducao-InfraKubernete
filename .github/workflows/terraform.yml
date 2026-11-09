@@ -1,0 +1,174 @@
+name: Terraform - Infra da Execucao no cluster
+
+# Provisiona o que e so da Execucao em volta do cluster compartilhado: ECR, role
+# de CI/CD (OIDC), target group no NodePort 8082, a policy das tabelas DynamoDB
+# nas roles dos nos e, na virada, a regra no listener do ALB interno. O cluster,
+# a VPC e o ALB vem do InfraKubernete, e a policy do ExecucaoProducao-InfraSGBD,
+# lidos via terraform_remote_state - por isso os dois precisam estar aplicados antes.
+#
+# - homologacao: plan a cada mudanca em infra/. Nao ha ambiente de homologacao
+#   na AWS, entao nada e aplicado a partir desta branch.
+# - main: plan e apply AUTOMATICO a cada mudanca em infra/, no Environment
+#   "production" - mas so com a Repository Variable PUBLICAR_AWS = "true".
+on:
+  push:
+    branches: [main, homologacao]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  pull_request:
+    branches: [main, homologacao]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "O que rodar (apply exige PUBLICAR_AWS e o Environment production)"
+        type: choice
+        default: plan
+        options: [plan, apply]
+
+permissions:
+  contents: read
+
+jobs:
+  # Le os defaults direto do variables.tf, para nao duplicar esses valores como
+  # Repository Variables no GitHub (fonte unica de verdade).
+  read-tf-vars:
+    name: Le variaveis padrao do Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      aws_region: ${{ steps.vars.outputs.aws_region }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extrai defaults do variables.tf
+        id: vars
+        run: |
+          value=$(awk '/variable "aws_region"/,/^}/' infra/variables.tf | grep default | sed -E 's/.*default[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')
+          if [ -z "$value" ]; then
+            echo "::error::Nao encontrei o default de aws_region em infra/variables.tf"
+            exit 1
+          fi
+          echo "aws_region=$value" >> "$GITHUB_OUTPUT"
+
+  plan:
+    name: Terraform plan
+    needs: read-tf-vars
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      # Enquanto a AWS nao estiver configurada para este repositorio (secrets
+      # ausentes), o plan vira so fmt + validate offline, sem falhar o PR.
+      - name: Confere se ha credenciais AWS
+        id: creds
+        env:
+          CHAVE: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "$CHAVE" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Sem AWS_ACCESS_KEY_ID neste repositorio: rodando so fmt e validate (sem backend), sem plan."
+          fi
+
+      # Chave estatica do terraform-deployer: a role de OIDC e criada por este
+      # proprio stack, e a mesma chave le os states remotos do InfraKubernete e
+      # do ExecucaoProducao-InfraSGBD.
+      - name: Configura credenciais AWS
+        if: steps.creds.outputs.ok == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ needs.read-tf-vars.outputs.aws_region }}
+
+      # Sem o bucket do state (ambiente AWS derrubado ou conta trocada), o init
+      # falharia em todo PR. Nesse caso o job so confere fmt e validate (sem
+      # backend) e avisa; o plan volta sozinho quando o bucket existir.
+      - name: Confere o bucket do state
+        id: bucket
+        if: steps.creds.outputs.ok == 'true'
+        run: |
+          BUCKET=$(grep -E '^[[:space:]]*bucket[[:space:]]*=' versions.tf | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if aws s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Bucket do state '$BUCKET' nao encontrado: rodando so fmt e validate, sem plan."
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
+
+      - name: Terraform fmt (check)
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        if: steps.bucket.outputs.ok == 'true'
+        run: terraform init -input=false
+
+      - name: Terraform init (sem backend)
+        if: steps.bucket.outputs.ok != 'true'
+        run: terraform init -input=false -backend=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        if: steps.bucket.outputs.ok == 'true'
+        run: terraform plan -input=false
+
+  apply:
+    name: Terraform apply
+    needs: [read-tf-vars, plan]
+    # Automatico em push na main; manual (workflow_dispatch) so a partir da
+    # main. Sem ambiente de homologacao, aplicar outra branch mexeria na
+    # producao com codigo nao revisado.
+    #
+    # Trava de publicacao: enquanto a Repository Variable PUBLICAR_AWS nao for
+    # "true", nem o push na main nem o disparo manual criam nada na AWS -
+    # so o plan roda.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      vars.PUBLICAR_AWS == 'true' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.action == 'apply'))
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: terraform-apply-execucao-k8s-prod
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configura credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ needs.read-tf-vars.outputs.aws_region }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        run: terraform apply -input=false -auto-approve
+
+      # O output github_actions_role_arn vai no secret AWS_ROLE_ARN deste
+      # repositorio e do ExecucaoProducao-service.
+      - name: Outputs
+        run: terraform output
