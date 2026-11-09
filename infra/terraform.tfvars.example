@@ -1,0 +1,7 @@
+# Copie para terraform.tfvars se precisar mudar algum padrao. Nao ha segredo
+# neste stack: o prefixo das tabelas vem do ExecucaoProducao-InfraSGBD e a chave
+# JWT, o New Relic e o RabbitMQ vem do InfraKubernete (todos pelo SSM).
+
+# Virada (Etapa 9): manda /api/execucao*, /api/estoque* e /api/servicos-oficina*
+# do monolito para a Execucao.
+# rotear_trafego_alb = true
