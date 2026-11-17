@@ -22,9 +22,9 @@ data:
   # Na AWS as tabelas vem do Terraform (ExecucaoProducao-InfraSGBD): a API nunca as cria.
   DynamoDb__CriarTabelas: "false"
 
-  # Consumidores da Saga desligados ate a virada (Etapa 9). Desligada, a API atende so
+  # Consumidores da Saga ligados (virada da Etapa 9). Desligada, a API atende so
   # pelas rotas REST e nao conecta no RabbitMQ.
-  Mensageria__Habilitada: "false"
+  Mensageria__Habilitada: "true"
   Mensageria__Transporte: "RabbitMq"
   RabbitMq__Host: "rabbitmq.mensageria.svc.cluster.local"
   RabbitMq__VirtualHost: "/"
