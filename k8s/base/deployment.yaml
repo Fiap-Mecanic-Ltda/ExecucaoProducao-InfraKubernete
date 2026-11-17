@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: execucao-service
+  namespace: execucao
+  labels:
+    app.kubernetes.io/part-of: mechanicltda
+    app.kubernetes.io/name: execucao-service
+spec:
+  # O HPA (hpa.yaml) controla as replicas; este valor so vale ate a primeira
+  # recomendacao dele.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: execucao-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: execucao-service
+    spec:
+      # A API nao fala com a API do Kubernetes: sem token da service account.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: execucao-service
+          image: mechanicltda-execucao:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: execucao-service-config
+            # DynamoDb__PrefixoTabelas e DynamoDb__Regiao, lidos do SSM (InfraSGBD) no deploy.
+            # As credenciais da AWS vem da role do no (IMDSv2), sem access key no pod.
+            - configMapRef:
+                name: execucao-service-dynamodb
+          env:
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: execucao-service-secrets
+                  key: JWT_SECRET_KEY
+            # Opcionais: sem RabbitMQ no cluster os consumidores ficam desligados
+            # de qualquer forma (Mensageria__Habilitada no ConfigMap).
+            - name: RabbitMq__Usuario
+              valueFrom:
+                secretKeyRef:
+                  name: execucao-service-secrets
+                  key: RabbitMq__Usuario
+                  optional: true
+            - name: RabbitMq__Senha
+              valueFrom:
+                secretKeyRef:
+                  name: execucao-service-secrets
+                  key: RabbitMq__Senha
+                  optional: true
+            # New Relic: "1" liga o profiler do agente .NET instalado na imagem.
+            - name: CORECLR_ENABLE_PROFILING
+              valueFrom:
+                secretKeyRef:
+                  name: execucao-service-secrets
+                  key: NEW_RELIC_PROFILING
+                  optional: true
+            - name: NEW_RELIC_LICENSE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: execucao-service-secrets
+                  key: NEW_RELIC_LICENSE_KEY
+                  optional: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "192Mi"
+              ephemeral-storage: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "384Mi"
+              ephemeral-storage: "512Mi"
+          # Da tempo ao boot (agente do New Relic e conexao com o broker) sem
+          # deixar o liveness/readiness reiniciar o container no meio.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            failureThreshold: 6

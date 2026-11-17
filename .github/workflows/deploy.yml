@@ -1,0 +1,292 @@
+name: Deploy da Execucao no Kubernetes (k3s)
+
+# Aplica os manifestos de producao da Execucao no k3s compartilhado. Roda
+# quando os manifestos mudam na main, sob demanda (workflow_dispatch) e quando o
+# ExecucaoProducao-service publica uma imagem nova no ECR (repository_dispatch).
+#
+# Mesmo desenho do deploy do InfraKubernete: sem kubeconfig exposto, o manifesto
+# vai para o S3 e o server aplica com kubectl via SSM Run Command.
+#
+# Trava de publicacao: sem a Repository Variable PUBLICAR_AWS = "true", o
+# workflow so renderiza os manifestos (confere que o kustomize monta tudo) e
+# nao toca na AWS.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "k8s/**"
+      - "scripts/**"
+      - ".github/workflows/deploy.yml"
+  pull_request:
+    branches: [main, homologacao]
+    paths:
+      - "k8s/**"
+      - "scripts/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Tag da imagem no ECR (vazio = ultima imagem publicada)"
+        type: string
+        required: false
+        default: ""
+  # Disparado pelo ExecucaoProducao-service depois de publicar a imagem no ECR. O
+  # GitHub sempre executa repository_dispatch a partir da branch padrao (main).
+  repository_dispatch:
+    types: [imagem-publicada]
+
+permissions:
+  contents: read
+  # Necessario para o OIDC do GitHub assumir a role da AWS.
+  id-token: write
+
+concurrency:
+  group: deploy-k8s-execucao-prod
+  cancel-in-progress: false
+
+env:
+  # Mesmo bucket do state remoto, usado so como area de troca dos manifestos
+  # com a instancia (prefixo deploy/execucao/, que a role da EC2 ja consegue ler).
+  STATE_BUCKET: mechanicltda-terraform-state-788516091173
+  NAMESPACE: execucao
+
+jobs:
+  read-tf-vars:
+    name: Le variaveis padrao do Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      aws_region: ${{ steps.vars.outputs.aws_region }}
+      project_name: ${{ steps.vars.outputs.project_name }}
+      environment: ${{ steps.vars.outputs.environment }}
+      service_name: ${{ steps.vars.outputs.service_name }}
+      ecr_repository_name: ${{ steps.vars.outputs.ecr_repository_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extrai defaults do variables.tf
+        id: vars
+        run: |
+          for name in aws_region project_name environment service_name ecr_repository_name; do
+            value=$(awk "/variable \"$name\"/,/^}/" infra/variables.tf | grep default | sed -E 's/.*default[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')
+            if [ -z "$value" ]; then
+              echo "::error::Nao encontrei o default de $name em infra/variables.tf"
+              exit 1
+            fi
+            echo "$name=$value" >> "$GITHUB_OUTPUT"
+          done
+
+  # Roda sempre (inclusive em PR e com a trava ligada): garante que o overlay de
+  # producao monta sem erro antes de qualquer deploy.
+  render:
+    name: Renderiza os manifestos (kustomize)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: kubectl kustomize
+        run: kubectl kustomize k8s/overlays/prod > /dev/null
+
+      - name: Aviso da trava de publicacao
+        if: github.event_name != 'pull_request' && vars.PUBLICAR_AWS != 'true'
+        run: echo "::notice::PUBLICAR_AWS nao esta 'true' neste repositorio - deploy na AWS pulado."
+
+  deploy:
+    name: Aplica os manifestos via SSM
+    needs: [read-tf-vars, render]
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main' &&
+      vars.PUBLICAR_AWS == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AWS_REGION: ${{ needs.read-tf-vars.outputs.aws_region }}
+      PROJECT_NAME: ${{ needs.read-tf-vars.outputs.project_name }}
+      ENVIRONMENT: ${{ needs.read-tf-vars.outputs.environment }}
+      SERVICE_NAME: ${{ needs.read-tf-vars.outputs.service_name }}
+      ECR_REPOSITORY: ${{ needs.read-tf-vars.outputs.ecr_repository_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configura credenciais AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Sem input, usa a imagem mais recente. A tag imutavel (SHA do commit) e
+      # preferida a "latest": o Deployment usa imagePullPolicy IfNotPresent.
+      - name: Resolve a tag da imagem
+        id: image
+        # A tag chega por variavel de ambiente, e nao interpolada no script:
+        # vem de input manual ou do payload do dispatch.
+        env:
+          TAG_INFORMADA: ${{ inputs.image_tag || github.event.client_payload.image_tag }}
+        run: |
+          TAG="$TAG_INFORMADA"
+          if [ -n "$TAG" ] && ! printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9._-]{1,128}$'; then
+            echo "::error::Tag de imagem invalida: use apenas letras, digitos, '.', '_' e '-'."
+            exit 1
+          fi
+          if [ -z "$TAG" ]; then
+            TAG=$(aws ecr describe-images \
+              --repository-name "$ECR_REPOSITORY" \
+              --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags' \
+              --output text | tr '\t' '\n' | grep -v '^latest$' | head -n1)
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "None" ]; then
+            echo "::error::Nenhuma imagem encontrada no ECR ($ECR_REPOSITORY). Rode a esteira do ExecucaoProducao-service primeiro, ou informe image_tag."
+            exit 1
+          fi
+          echo "Usando a tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # O server do k3s (onde o kubectl roda) e descoberto pela tag Name: o id
+      # muda quando o InfraKubernete recria a instancia.
+      - name: Descobre o Instance ID do server k3s
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${PROJECT_NAME}-${ENVIRONMENT}-api" "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" --output text)
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::Nao encontrei o server k3s rodando. O cluster do InfraKubernete precisa estar no ar."
+            exit 1
+          fi
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Renderiza os manifestos com a imagem do ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          cp -r k8s /tmp/prod-render
+          cat >> /tmp/prod-render/overlays/prod/kustomization.yaml <<EOF
+          images:
+            - name: mechanicltda-execucao
+              newName: ${ECR_REGISTRY}/${ECR_REPOSITORY}
+              newTag: ${IMAGE_TAG}
+          EOF
+          kubectl kustomize /tmp/prod-render/overlays/prod > /tmp/app-manifests.yaml
+
+      # Segredos nunca ficam no YAML versionado: vem do SSM e o Secret e
+      # montado aqui. Prefixo e regiao das tabelas do prefixo do servico
+      # (ExecucaoProducao-InfraSGBD); chave JWT, New Relic e RabbitMQ do prefixo
+      # compartilhado (InfraKubernete). As tabelas sao acessadas com a role do
+      # no, entao nenhuma credencial da AWS entra no Secret.
+      - name: Monta os Secrets a partir do SSM
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          PREFIXO="/${PROJECT_NAME}/${ENVIRONMENT}"
+          PREFIXO_SERVICO="${PREFIXO}/${SERVICE_NAME}"
+          obrigatorio() { aws ssm get-parameter --name "$1" --with-decryption --query 'Parameter.Value' --output text; }
+          opcional() { aws ssm get-parameter --name "$1" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || true; }
+
+          PREFIXO_TABELAS=$(obrigatorio "$PREFIXO_SERVICO/dynamodb-prefixo-tabelas") || {
+            echo "::error::Sem $PREFIXO_SERVICO/dynamodb-prefixo-tabelas no SSM. Aplique o ExecucaoProducao-InfraSGBD primeiro."
+            exit 1
+          }
+          REGIAO_TABELAS=$(obrigatorio "$PREFIXO_SERVICO/dynamodb-regiao")
+          JWT=$(obrigatorio "$PREFIXO/jwt-secret-key")
+
+          NEW_RELIC_LICENSE_KEY=$(opcional "$PREFIXO/newrelic-license-key")
+          if [ -n "$NEW_RELIC_LICENSE_KEY" ]; then
+            echo "::add-mask::$NEW_RELIC_LICENSE_KEY"
+            NEW_RELIC_PROFILING=1
+          else
+            NEW_RELIC_PROFILING=0
+          fi
+
+          RABBITMQ_USER=$(opcional "$PREFIXO/mensageria/rabbitmq-user")
+          RABBITMQ_SEGREDO=$(opcional "$PREFIXO/mensageria/rabbitmq-segredo")
+          [ -n "$RABBITMQ_SEGREDO" ] && echo "::add-mask::$RABBITMQ_SEGREDO"
+          if [ -z "$RABBITMQ_SEGREDO" ]; then
+            echo "::notice::Sem credenciais do RabbitMQ no SSM: os consumidores da Saga precisam continuar desligados (Mensageria__Habilitada=false)."
+          fi
+
+          kubectl create configmap execucao-service-dynamodb \
+            --namespace "$NAMESPACE" \
+            --from-literal=DynamoDb__PrefixoTabelas="$PREFIXO_TABELAS" \
+            --from-literal=DynamoDb__Regiao="$REGIAO_TABELAS" \
+            --dry-run=client -o yaml > /tmp/secret-manifest.yaml
+
+          # "---" obrigatorio entre documentos concatenados a mao.
+          echo "---" >> /tmp/secret-manifest.yaml
+
+          kubectl create secret generic execucao-service-secrets \
+            --namespace "$NAMESPACE" \
+            --from-literal=JWT_SECRET_KEY="$JWT" \
+            --from-literal=RabbitMq__Usuario="$RABBITMQ_USER" \
+            --from-literal=RabbitMq__Senha="$RABBITMQ_SEGREDO" \
+            --from-literal=NEW_RELIC_LICENSE_KEY="$NEW_RELIC_LICENSE_KEY" \
+            --from-literal=NEW_RELIC_PROFILING="$NEW_RELIC_PROFILING" \
+            --dry-run=client -o yaml >> /tmp/secret-manifest.yaml
+
+          # "---" obrigatorio entre documentos concatenados a mao.
+          echo "---" >> /tmp/secret-manifest.yaml
+
+          kubectl create secret docker-registry ecr-creds \
+            --namespace "$NAMESPACE" \
+            --docker-server="${ECR_REGISTRY}" \
+            --docker-username=AWS \
+            --docker-password="$(aws ecr get-login-password --region "$AWS_REGION")" \
+            --dry-run=client -o yaml >> /tmp/secret-manifest.yaml
+
+      - name: Envia os manifestos para o server via SSM e aplica
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          # App e Secrets em dois "kubectl apply" separados, como no
+          # InfraKubernete (no mesmo stream, o patch do ultimo recurso corrompia).
+          BASE="deploy/${SERVICE_NAME}"
+          APP_KEY="$BASE/app-${{ github.sha }}.yaml"
+          SECRET_KEY="$BASE/secret-${{ github.sha }}.yaml"
+          SCRIPT_KEY="$BASE/instalar-refresh-ecr-${{ github.sha }}.sh"
+          aws s3 cp /tmp/app-manifests.yaml "s3://${STATE_BUCKET}/${APP_KEY}"
+          aws s3 cp /tmp/secret-manifest.yaml "s3://${STATE_BUCKET}/${SECRET_KEY}"
+          aws s3 cp scripts/instalar-refresh-ecr.sh "s3://${STATE_BUCKET}/${SCRIPT_KEY}"
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "{\"commands\":[\"export KUBECONFIG=/etc/rancher/k3s/k3s.yaml\",\"aws s3 cp s3://${STATE_BUCKET}/${APP_KEY} - | /usr/local/bin/kubectl apply -f -\",\"aws s3 cp s3://${STATE_BUCKET}/${SECRET_KEY} - | /usr/local/bin/kubectl apply -f -\",\"aws s3 cp s3://${STATE_BUCKET}/${SCRIPT_KEY} - | bash -s -- ${AWS_REGION} ${ECR_REGISTRY} ${NAMESPACE}\"]}" \
+            --query "Command.CommandId" --output text)
+
+          bash "$GITHUB_WORKSPACE/scripts/esperar-ssm.sh" "$COMMAND_ID" "$INSTANCE_ID" 600 > /tmp/invocation.json || true
+          cat /tmp/invocation.json
+
+          aws s3 rm "s3://${STATE_BUCKET}/${APP_KEY}" || true
+          aws s3 rm "s3://${STATE_BUCKET}/${SECRET_KEY}" || true
+          aws s3 rm "s3://${STATE_BUCKET}/${SCRIPT_KEY}" || true
+
+          STATUS=$(python3 -c "import json;print(json.load(open('/tmp/invocation.json'))['Status'])")
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Falha ao aplicar os manifestos via SSM (status: $STATUS)"
+            exit 1
+          fi
+
+      - name: Aguarda o rollout via SSM
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "{\"commands\":[\"export KUBECONFIG=/etc/rancher/k3s/k3s.yaml\",\"/usr/local/bin/kubectl rollout status deployment/execucao-service -n ${NAMESPACE} --timeout=300s\"]}" \
+            --query "Command.CommandId" --output text)
+
+          bash "$GITHUB_WORKSPACE/scripts/esperar-ssm.sh" "$COMMAND_ID" "$INSTANCE_ID" 360 > /tmp/rollout.json || true
+          cat /tmp/rollout.json
+          STATUS=$(python3 -c "import json;print(json.load(open('/tmp/rollout.json'))['Status'])")
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Rollout nao completou a tempo (status: $STATUS)"
+            exit 1
+          fi

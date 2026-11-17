@@ -1,0 +1,18 @@
+# Terraform
+infra/.terraform/
+infra/.terraform.tfstate.lock.info
+infra/*.tfstate
+infra/*.tfstate.*
+infra/crash.log*
+infra/*.tfvars
+!infra/terraform.tfvars.example
+infra/tfplan
+infra/*.tfplan
+
+# Editores e SO
+.vs/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

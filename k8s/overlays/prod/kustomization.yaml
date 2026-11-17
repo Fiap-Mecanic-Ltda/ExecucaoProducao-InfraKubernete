@@ -1,0 +1,35 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: execucao
+
+resources:
+  - ../../base
+
+# A tag da imagem e o registry do ECR sao definidos pela pipeline antes do
+# apply (ver .github/workflows/deploy.yml).
+
+patches:
+  # NodePort fixo: o ALB interno manda o trafego do target group da Execucao
+  # (infra/alb.tf) para esta porta em todos os nos. A porta e liberada no SG
+  # dos nos pelo InfraKubernete (microsservicos_node_ports).
+  - target:
+      kind: Service
+      name: execucao-service
+    patch: |-
+      - op: replace
+        path: /spec/type
+        value: NodePort
+      - op: add
+        path: /spec/ports/0/nodePort
+        value: 8082
+  # Pull do ECR com o Secret docker-registry "ecr-creds" deste namespace, criado
+  # a cada deploy e renovado por um timer no server (scripts/refresh-ecr-creds.sh).
+  - target:
+      kind: Deployment
+      name: execucao-service
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value:
+          - name: ecr-creds
