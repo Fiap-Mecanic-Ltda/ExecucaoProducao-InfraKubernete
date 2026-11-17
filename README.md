@@ -80,7 +80,7 @@ ExecucaoProducao-InfraKubernete/
 │   ├── github_oidc.tf       # role de CI/CD do serviço (ECR, SSM, S3 deploy/execucao/)
 │   └── outputs.tf
 ├── k8s/
-│   ├── base/                # Namespace, ConfigMap, Deployment, Service, HPA
+│   ├── base/                # Namespace, ConfigMap, Deployment, Service, HPA (só CPU, até 3 réplicas)
 │   └── overlays/prod/       # NodePort 8082 + imagePullSecrets do ECR
 ├── scripts/
 │   ├── esperar-ssm.sh       # espera o Run Command terminar
